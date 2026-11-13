@@ -13,9 +13,10 @@ A production-grade learning repository tracking the evolution of building an aut
 5. [Phase 2: Multi-Agent Collaboration & Handoffs](#-phase-2-multi-agent-collaboration--handoffs)
 6. [Phase 3: Cyclic Graphs & The Self-Correction Reflection Loop](#-phase-3-cyclic-graphs--the-self-correction-reflection-loop)
 7. [Phase 4: LLM-as-a-Judge with Numerical Rubric & Plateau Detection](#-phase-4-llm-as-a-judge-with-numerical-rubric--plateau-detection)
-8. [Real Execution Walkthrough (Case Study)](#-real-execution-walkthrough-case-study)
-9. [System Deep-Dive: State, Memory, & Context Size](#-system-deep-dive-state-memory--context-size)
-10. [Interview Q&A Cheat Sheet](#-interview-qa-cheat-sheet)
+8. [Phase 5: Conversational Session Memory with MemorySaver](#-phase-5-conversational-session-memory-with-memorysaver)
+9. [Real Execution Walkthrough (Case Study)](#-real-execution-walkthrough-case-study)
+10. [System Deep-Dive: State, Memory, & Context Size](#-system-deep-dive-state-memory--context-size)
+11. [Interview Q&A Cheat Sheet](#-interview-qa-cheat-sheet)
 
 ---
 
@@ -38,9 +39,11 @@ multi-agent-research-system/
 ├── .env                  # Private API keys (GEMINI_API_KEY)
 ├── requirements.txt      # Dependencies (langgraph, langchain-google-genai, etc.)
 ├── main.py               # Decoupled CLI entrypoint (User terminal interface)
+├── logs/                 # Timestamped session logs (one file per CLI session until Ctrl+C)
 ├── core/
 │   ├── __init__.py       # Package marker
 │   ├── llm.py            # Standard Gemini API client (HTTP / SDK integration)
+│   ├── logger.py         # Session-level Logger (records entire interactive session)
 │   └── graph.py          # State schema, Agent Nodes, Conditional Edges & Graph Engine
 └── README.md             # Complete system documentation
 ```
@@ -225,6 +228,55 @@ def should_continue(state: ResearchState) -> str:
     # 4. Under target and improving -> Revise!
     return "revise"
 ```
+
+---
+
+## 🧠 Phase 5: Conversational Session Memory with MemorySaver
+
+Without persistence, each prompt starts with a completely blank state. When a user asks follow-up questions (e.g., *"Now compare that name with Alexander"* or *"You remember we were talking about Siddharth"*), the agents have no recollection of prior turns.
+
+Phase 5 introduces **Multi-Turn Session Memory** using LangGraph's **`MemorySaver` Checkpointer** and **State Reducers**:
+
+### 1. The State Reducer (`operator.add`)
+Instead of overwriting previous messages, the reducer tells LangGraph to **accumulate and append** new turns to the existing list:
+```python
+import operator
+from typing import Annotated, List, TypedDict
+
+class ResearchState(TypedDict):
+    prompt: str
+    chat_history: Annotated[List[dict], operator.add]  # 🆕 Automatically appends across turns!
+    draft: Optional[str]
+    evaluation: Optional[Evaluation]
+    score_history: List[float]
+    final_report: Optional[str]
+    revision_count: int
+    exit_reason: Optional[str]
+```
+
+### 2. Compiling with `MemorySaver`
+```python
+from langgraph.checkpoint.memory import MemorySaver
+
+checkpointer = MemorySaver()
+app = workflow.compile(checkpointer=checkpointer)
+```
+
+### 3. Thread-Aware Invocations
+When invoking the graph, passing a `thread_id` config instructs `MemorySaver` to look up existing state for that thread:
+```python
+config = {"configurable": {"thread_id": "session_20261114_030000"}}
+result = app.invoke(initial_state, config=config)
+```
+
+### 4. Conversational Awareness in Agent Prompts
+Agent 1 (`researcher_node`) reviews the accumulated `chat_history`:
+```python
+if chat_history:
+    history_context = "Previous Conversation History:\n" + ...
+    researcher_prompt = f"{history_context}Current User Query: {prompt}"
+```
+This enables agents to carry forward context, acknowledge earlier topics, and answer comparative or contextual follow-ups seamlessly!
 
 ---
 

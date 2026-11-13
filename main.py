@@ -1,5 +1,6 @@
 import os
 from core.graph import run_research
+from core.logger import SessionLogger, set_current_logger
 
 
 def main():
@@ -13,27 +14,41 @@ def main():
     else:
         print("🔑 API Key configured.")
 
-    print("\nType your prompt and press Enter. Type 'exit' or 'q' to quit.\n")
+    # Start session logger
+    session_logger = SessionLogger()
+    set_current_logger(session_logger)
 
-    while True:
-        try:
-            prompt = input("👉 Enter prompt: ").strip()
-        except (KeyboardInterrupt, EOFError):
-            print("\nExiting...")
-            break
+    # Unique thread_id for this CLI session (used by MemorySaver)
+    thread_id = f"session_{session_logger.timestamp}"
+    print(f"📁 [Session Logger]: Recording session to logs/{session_logger.filename}")
+    print(f"🧠 [MemorySaver]: Thread ID active: '{thread_id}'\n")
 
-        if not prompt:
-            continue
+    print("Type your prompt and press Enter. Type 'exit' or 'q' to quit.\n")
 
-        if prompt.lower() in ("exit", "quit", "q"):
-            print("Goodbye!")
-            break
+    try:
+        while True:
+            try:
+                prompt = input("👉 Enter prompt: ").strip()
+            except (KeyboardInterrupt, EOFError):
+                print("\nExiting session...")
+                break
 
-        print("\nThinking...")
-        answer = run_research(prompt)
-        print("\n--- Answer ---")
-        print(answer)
-        print("-" * 60 + "\n")
+            if not prompt:
+                continue
+
+            if prompt.lower() in ("exit", "quit", "q"):
+                print("Goodbye!")
+                break
+
+            print("\nThinking...")
+            answer = run_research(prompt, thread_id=thread_id)
+            print("\n--- Answer ---")
+            print(answer)
+            print("-" * 60 + "\n")
+
+    finally:
+        session_logger.end_session()
+        print(f"📁 [Session Logger]: Session closed -> logs/{session_logger.filename}\n")
 
 
 if __name__ == "__main__":

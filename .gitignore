@@ -15,6 +15,7 @@ chroma_db/
 
 # Output files (optional - remove this line to include outputs)
 output/*.md
+logs/
 
 # IDE
 .vscode/
