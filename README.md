@@ -45,6 +45,8 @@ multi-agent-research-system/
 │   ├── llm.py            # Standard Gemini API client (HTTP / SDK integration)
 │   ├── logger.py         # Session-level Logger (records entire interactive session)
 │   └── graph.py          # State schema, Agent Nodes, Conditional Edges & Graph Engine
+├── .agents/skills/       # Antigravity Skills directory
+│   └── langgraph-multi-agent-system/SKILL.md # Persistent system skill runbook
 └── README.md             # Complete system documentation
 ```
 
