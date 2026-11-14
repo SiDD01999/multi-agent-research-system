@@ -1,41 +1,60 @@
 """
-LangGraph Multi-Agent Workflow: Step 5 (MemorySaver & Conversational State)
+LangGraph Multi-Agent Workflow: Step 5+ (Progressive Summary-Buffer Memory)
 -------------------------------------------------------------------------
-Pattern: Evaluator-Optimizer with Checkpointer Memory & State Reducers
+Pattern: Evaluator-Optimizer with Checkpointer Memory, Summary Compactor & Custom Reducer
 
 Architecture:
-  START ──► [Agent 1: Researcher] ──► [Agent 2: LLM Judge] ──► should_continue?
-                 ▲                                                    │
-                 │                    (Score < 8.5 & Improving)       │
-                 └─────────────────── "revise" ◄──────────────────────┤
-                                                                      │
-                                      (Score >= 8.5 / Plateau / Limit)│
-                                      "finalize" ─────────────────────► [Formatter] ──► END
+  START ──► [Memory Compactor] ──► [Agent 1: Researcher] ──► [Agent 2: LLM Judge] ──► should_continue?
+                                         ▲                                                    │
+                                         │                    (Score < 8.5 & Improving)       │
+                                         └─────────────────── "revise" ◄──────────────────────┤
+                                                                                              │
+                                                              (Score >= 8.5 / Plateau / Limit)│
+                                                              "finalize" ─────────────────────► [Formatter] ──► END
 
 Key Concepts:
 1. MemorySaver Checkpointer: Persists state snapshots across multiple turns via thread_id.
-2. State Reducers (Annotated[List[dict], operator.add]): Automatically appends messages across turns.
-3. Multi-Turn Conversational Awareness: Researcher references previous conversation context.
-4. Multi-dimensional scoring rubric & Plateau detection.
+2. Progressive Summary-Buffer Pattern: Automatically compacts older turns into a rolling summary.
+3. Custom Reducer (`manage_chat_history`): Manages active message buffer with both append and replacement modes.
+4. Multi-Turn Conversational Awareness: Researcher references both rolling summary and immediate recent buffer.
+5. Multi-dimensional scoring rubric & Plateau detection.
 """
 
 import json
 import operator
-from typing import TypedDict, Optional, List, Annotated
+from typing import TypedDict, Optional, List, Annotated, Any
 from core.llm import call_gemini
 from core.logger import ExecutionLogger, get_current_logger, set_current_logger
 
 # ============================================================================
-# CONFIGURABLE EVALUATION THRESHOLDS
+# CONFIGURABLE EVALUATION & MEMORY THRESHOLDS
 # ============================================================================
 TARGET_SCORE = 8.5       # Score out of 10 required to pass immediately
 MAX_REVISIONS = 3        # Maximum iterations to prevent runaway loops
 PLATEAU_THRESHOLD = 0.2  # Minimum score improvement needed between consecutive rounds
+BUFFER_LIMIT = 4         # Maximum raw messages in active buffer before compaction (~2 turns)
 
 
 # ============================================================================
-# 1. DEFINE STATE (The shared clipboard across all agents)
+# 1. DEFINE STATE & REDUCERS (The shared clipboard across all agents)
 # ============================================================================
+def manage_chat_history(existing: Optional[List[dict]], incoming: Any) -> List[dict]:
+    """
+    Custom state reducer for chat_history:
+    - If incoming is a dict with {"mode": "replace", "messages": [...]}, replaces the buffer.
+    - If incoming is a list of messages, appends to the buffer.
+    - If incoming is None or empty, preserves existing messages.
+    """
+    existing = list(existing or [])
+    if not incoming:
+        return existing
+    if isinstance(incoming, dict) and incoming.get("mode") == "replace":
+        return list(incoming.get("messages", []))
+    if isinstance(incoming, list):
+        return existing + incoming
+    return existing
+
+
 class Evaluation(TypedDict):
     completeness: int
     technical_depth: int
@@ -46,8 +65,8 @@ class Evaluation(TypedDict):
 
 class ResearchState(TypedDict):
     prompt: str
-    # 🆕 State Reducer: Appends new turns to chat history instead of overwriting!
-    chat_history: Annotated[List[dict], operator.add]
+    summary: Optional[str]                             # 🆕 Progressive rolling summary of older turns
+    chat_history: Annotated[List[dict], manage_chat_history]  # 🆕 Smart buffer with append & compaction support
     draft: Optional[str]
     evaluation: Optional[Evaluation]
     score_history: List[float]
@@ -86,30 +105,97 @@ def extract_json(raw_text: str) -> dict:
 # ============================================================================
 # 2. DEFINE AGENT NODES
 # ============================================================================
+def memory_compactor_node(state: ResearchState) -> dict:
+    """
+    Pre-Node: Memory Compactor (Progressive Summarization / Summary-Buffer Pattern)
+    Checks if raw chat_history exceeds BUFFER_LIMIT (e.g., 4 messages / ~2 full turns).
+    If exceeded:
+      - Takes older messages beyond the most recent 2 messages (1 turn).
+      - Calls Gemini to condense/merge them into the rolling executive `summary`.
+      - Replaces raw `chat_history` with only the retained recent messages.
+    If within limit:
+      - Passes through with zero LLM overhead.
+    """
+    chat_history = state.get("chat_history", [])
+    current_summary = state.get("summary", "")
+    logger = get_current_logger()
+
+    if len(chat_history) <= BUFFER_LIMIT:
+        return {}
+
+    # Keep the most recent 2 messages (1 turn: user query + assistant answer)
+    to_compress = chat_history[:-2]
+    to_keep = chat_history[-2:]
+
+    print(f"\n  [Memory Compactor 🧠]: Chat history exceeded buffer ({len(chat_history)} > {BUFFER_LIMIT}). Compacting {len(to_compress)} older messages into summary...")
+
+    formatted_messages = "\n".join(
+        f"{m.get('role', 'user').capitalize()}: {m.get('content', '')[:300]}"
+        for m in to_compress
+    )
+
+    compaction_prompt = f"""You are the Memory Management Agent for an autonomous research system.
+Your job is to maintain a progressive, cumulative executive summary of past conversation turns.
+
+Existing Summary:
+{current_summary if current_summary else "No previous summary (first compaction cycle)."}
+
+Older Conversation Turns to Condense:
+{formatted_messages}
+
+Instructions:
+1. Synthesize the core topics, user preferences, technical constraints, established facts, and conclusions from the new turns into the existing summary.
+2. Keep the summary dense, factual, and strictly under 150 words.
+3. Preserve specific technical names, frameworks, constraints, or decisions discussed.
+4. Output ONLY the updated summary text with no preamble or commentary."""
+
+    new_summary = call_gemini(compaction_prompt)
+
+    if logger:
+        logger.log_step(
+            f"Memory Compactor: Compressed {len(to_compress)} Messages",
+            f"[UPDATED ROLLING SUMMARY]:\n{new_summary}\n\n[RETAINED BUFFER COUNT]: {len(to_keep)}"
+        )
+
+    print(f"  [Memory Compactor ✅]: Rolling summary updated. Active buffer reduced to {len(to_keep)} messages.")
+
+    return {
+        "summary": new_summary,
+        "chat_history": {"mode": "replace", "messages": to_keep}
+    }
+
+
 def researcher_node(state: ResearchState) -> dict:
     """
     Agent 1: Researcher / Generator
-    - Conversational Awareness: Inspects previous turns in chat_history.
+    - Conversational Awareness: Combines rolling summary (long-term) + active buffer (immediate dialogue).
     - Round 0: Gathers comprehensive facts for the current prompt.
     - Round 1+: Reads specific gaps identified by the LLM Judge to fix weaknesses.
     """
     prompt = state.get("prompt", "")
+    summary = state.get("summary")
     evaluation = state.get("evaluation")
     revision_count = state.get("revision_count", 0)
     chat_history = state.get("chat_history", [])
     logger = get_current_logger()
 
-    # Format previous turns context (taking up to last 4 messages for concise context)
-    history_context = ""
+    # Build conversational context using both progressive summary and active buffer
+    context_blocks = []
+    if summary:
+        context_blocks.append(f"Cumulative Conversation Summary (Long-Term Context):\n{summary}")
+
     if chat_history:
         history_lines = []
-        for msg in chat_history[-4:]:
+        for msg in chat_history:
             role = msg.get("role", "user").capitalize()
             content = msg.get("content", "")
-            # Truncate older lengthy assistant answers in context
             preview = content[:250] + "..." if len(content) > 250 else content
             history_lines.append(f"- {role}: {preview}")
-        history_context = "Previous Conversation History:\n" + "\n".join(history_lines) + "\n\n"
+        context_blocks.append("Immediate Recent Dialogue (Active Buffer):\n" + "\n".join(history_lines))
+
+    history_context = ""
+    if context_blocks:
+        history_context = "=== CONVERSATIONAL CONTEXT ===\n" + "\n\n".join(context_blocks) + "\n==============================\n\n"
 
     if evaluation and evaluation.get("gaps"):
         gaps_list = "\n- ".join(evaluation["gaps"])
@@ -352,12 +438,14 @@ def build_research_graph():
         workflow = StateGraph(ResearchState)
 
         # 1. Register Nodes
+        workflow.add_node("memory_compactor", memory_compactor_node)
         workflow.add_node("researcher", researcher_node)
         workflow.add_node("judge", judge_node)
         workflow.add_node("formatter", formatter_node)
 
         # 2. Add Fixed Edges
-        workflow.add_edge(START, "researcher")
+        workflow.add_edge(START, "memory_compactor")
+        workflow.add_edge("memory_compactor", "researcher")
         workflow.add_edge("researcher", "judge")
         workflow.add_edge("formatter", END)
 
@@ -395,6 +483,7 @@ def get_graph():
 
 # Fallback memory for non-langgraph execution
 _fallback_chat_history: List[dict] = []
+_fallback_summary: str = ""
 
 
 # ============================================================================
@@ -442,13 +531,24 @@ def run_research(prompt: str, thread_id: str = "default_cli_session") -> str:
         return result.get("final_report", "⚠️ No report generated in final state.")
     else:
         print("ℹ️ Note: 'langgraph' package not detected. Running direct fallback...\n")
-        # Fallback with simple memory
-        hist_str = ""
+        # Fallback with progressive summary-buffer memory
+        hist_parts = []
+        if _fallback_summary:
+            hist_parts.append(f"Past Conversation Summary:\n{_fallback_summary}")
         if _fallback_chat_history:
-            hist_str = "Conversation history:\n" + "\n".join(f"{m['role']}: {m['content'][:200]}" for m in _fallback_chat_history[-3:]) + "\n\n"
+            hist_parts.append("Recent Conversation History:\n" + "\n".join(f"{m['role']}: {m['content'][:250]}" for m in _fallback_chat_history))
+        
+        hist_str = "\n\n".join(hist_parts) + "\n\n" if hist_parts else ""
         answer = call_gemini(f"{hist_str}User: {prompt}")
         _fallback_chat_history.append({"role": "user", "content": prompt})
         _fallback_chat_history.append({"role": "assistant", "content": answer})
+
+        if len(_fallback_chat_history) > BUFFER_LIMIT:
+            to_comp = _fallback_chat_history[:-2]
+            _fallback_chat_history = _fallback_chat_history[-2:]
+            comp_prompt = f"Existing Summary: {_fallback_summary}\n\nNew turns:\n{json.dumps(to_comp)}\n\nUpdate the concise summary under 150 words."
+            _fallback_summary = call_gemini(comp_prompt)
+
         logger.log_step("Direct Fallback Output", answer)
         logger.end_turn("Direct Fallback", 0.0, 0)
         return answer

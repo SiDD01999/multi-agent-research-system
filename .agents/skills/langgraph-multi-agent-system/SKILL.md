@@ -40,30 +40,34 @@ multi-agent-research-system/
 
 ### Pillar 1: The Evaluator-Optimizer Cyclic Graph
 ```
-START ──► [Agent 1: Researcher] ──► [Agent 2: LLM Judge] ──► should_continue?
-               ▲                                                    │
-               │                    (Score < 8.5 & Improving)       │
-               └─────────────────── "revise" ◄──────────────────────┤
-                                                                    │
-                                    (Score >= 8.5 / Plateau / Limit)│
-                                    "finalize" ─────────────────────► [Agent 3: Formatter] ──► END
+START ──► [Memory Compactor] ──► [Agent 1: Researcher] ──► [Agent 2: LLM Judge] ──► should_continue?
+                                       ▲                                                    │
+                                       │                    (Score < 8.5 & Improving)       │
+                                       └─────────────────── "revise" ◄──────────────────────┤
+                                                                                            │
+                                                            (Score >= 8.5 / Plateau / Limit)│
+                                                            "finalize" ─────────────────────► [Agent 3: Formatter] ──► END
 ```
 
-### Pillar 2: State Schema & Reducers (`core/graph.py`)
+### Pillar 2: State Schema & Smart Reducer (`core/graph.py`)
 ```python
-import operator
-from typing import TypedDict, Optional, List, Annotated
+from typing import TypedDict, Optional, List, Annotated, Any
 
-class Evaluation(TypedDict):
-    completeness: int        # 1-10
-    technical_depth: int     # 1-10
-    structure: int           # 1-10
-    overall_score: float     # Average of 3 dimensions
-    gaps: List[str]          # Actionable deficiencies
+def manage_chat_history(existing: Optional[List[dict]], incoming: Any) -> List[dict]:
+    """Smart reducer supporting both message appending and compactor replacement."""
+    existing = list(existing or [])
+    if not incoming:
+        return existing
+    if isinstance(incoming, dict) and incoming.get("mode") == "replace":
+        return list(incoming.get("messages", []))
+    if isinstance(incoming, list):
+        return existing + incoming
+    return existing
 
 class ResearchState(TypedDict):
     prompt: str
-    chat_history: Annotated[List[dict], operator.add]  # 🆕 State reducer appends turns
+    summary: Optional[str]                             # 🆕 Progressive rolling summary
+    chat_history: Annotated[List[dict], manage_chat_history]  # 🆕 Bounded active buffer
     draft: Optional[str]
     evaluation: Optional[Evaluation]
     score_history: List[float]       # Tracks progression across cycles
@@ -78,10 +82,11 @@ class ResearchState(TypedDict):
 * **Plateau Detection**: If $\Delta \text{score} < 0.2$ between consecutive cycles, halts early to eliminate diminishing returns and save API tokens.
 * **Targeted Gap Correction**: Researcher receives specific items from `evaluation["gaps"]` rather than blindly regenerating.
 
-### Pillar 4: Conversational Session Memory (`MemorySaver`)
+### Pillar 4: Progressive Summary-Buffer Memory (`MemorySaver` + Compactor)
 * Compiled with `checkpointer = MemorySaver()`.
 * Invoked with `config = {"configurable": {"thread_id": f"session_{timestamp}"}}`.
-* Agent 1 (`researcher_node`) reviews `chat_history[-4:]` to maintain context across multi-turn interactions.
+* **Memory Compactor Pre-Node**: Automatically runs before Researcher. When active messages exceed `BUFFER_LIMIT = 4`, it compresses older turns into a rolling `summary` and keeps only the latest turn in `chat_history`.
+* **Researcher Context**: Combines both the persistent executive summary (long-term) and the immediate dialogue buffer (short-term). Prevents unbounded checkpoint bloat and token waste.
 
 ### Pillar 5: Continuous Session Execution Logger (`core/logger.py`)
 * Created once per `python main.py` invocation: `logs/execution_logs_<timestamp>.txt`.
