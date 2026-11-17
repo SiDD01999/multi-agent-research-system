@@ -22,19 +22,34 @@ load_env()
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
 
-def call_gemini(prompt: str, model: str = "gemini-flash-lite-latest") -> str:
+def call_gemini(prompt: str, model: str = "gemini-flash-lite-latest", enable_search: bool = False) -> str:
     """
     Direct Gemini API call using Python standard library.
+    Optionally enables native Google Search Grounding when enable_search=True.
+    """
+    result = call_gemini_grounded(prompt, model=model, enable_search=enable_search)
+    return result.get("text", "")
+
+
+def call_gemini_grounded(prompt: str, model: str = "gemini-flash-lite-latest", enable_search: bool = True) -> dict:
+    """
+    Calls Gemini API with Google Search Grounding enabled.
+    Returns structured dictionary with generated text, search queries, and web source citations.
     """
     api_key = os.environ.get("GEMINI_API_KEY") or GEMINI_API_KEY
     if not api_key:
-        return "❌ Error: GEMINI_API_KEY is not set. Please check your .env file."
+        return {
+            "text": "❌ Error: GEMINI_API_KEY is not set. Please check your .env file.",
+            "search_queries": [],
+            "sources": []
+        }
 
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     headers = {
         "Content-Type": "application/json",
         "X-goog-api-key": api_key,
     }
+
     payload = {
         "contents": [
             {
@@ -42,6 +57,10 @@ def call_gemini(prompt: str, model: str = "gemini-flash-lite-latest") -> str:
             }
         ]
     }
+
+    # Attach Google Search grounding tool if enabled
+    if enable_search:
+        payload["tools"] = [{"google_search": {}}]
 
     req = urllib.request.Request(
         url,
@@ -51,14 +70,41 @@ def call_gemini(prompt: str, model: str = "gemini-flash-lite-latest") -> str:
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=30) as response:
+        with urllib.request.urlopen(req, timeout=40) as response:
             data = json.loads(response.read().decode("utf-8"))
             candidates = data.get("candidates", [])
-            if candidates:
-                parts = candidates[0].get("content", {}).get("parts", [])
-                text = "".join(part.get("text", "") for part in parts)
-                return text.strip()
-            return "⚠️ No response text returned by the model."
+            if not candidates:
+                return {
+                    "text": "⚠️ No response text returned by the model.",
+                    "search_queries": [],
+                    "sources": []
+                }
+
+            first_candidate = candidates[0]
+            parts = first_candidate.get("content", {}).get("parts", [])
+            text = "".join(part.get("text", "") for part in parts).strip()
+
+            # Extract Google Search Grounding Metadata
+            grounding = first_candidate.get("groundingMetadata", {})
+            search_queries = grounding.get("webSearchQueries", [])
+            sources = []
+            seen_urls = set()
+
+            for chunk in grounding.get("groundingChunks", []):
+                web = chunk.get("web", {})
+                uri = web.get("uri")
+                if uri and uri not in seen_urls:
+                    seen_urls.add(uri)
+                    sources.append({
+                        "title": web.get("title", "Web Reference"),
+                        "url": uri
+                    })
+
+            return {
+                "text": text,
+                "search_queries": search_queries,
+                "sources": sources
+            }
 
     except urllib.error.HTTPError as e:
         error_body = e.read().decode("utf-8")
@@ -67,6 +113,19 @@ def call_gemini(prompt: str, model: str = "gemini-flash-lite-latest") -> str:
             msg = err_json.get("error", {}).get("message", error_body)
         except Exception:
             msg = error_body
-        return f"❌ Gemini API Error ({e.code}): {msg}"
+        
+        # If model failed due to search tool incompatibility, retry once without search
+        if enable_search and "tool" in error_body.lower():
+            return call_gemini_grounded(prompt, model=model, enable_search=False)
+
+        return {
+            "text": f"❌ Gemini API Error ({e.code}): {msg}",
+            "search_queries": [],
+            "sources": []
+        }
     except Exception as e:
-        return f"❌ Request error: {str(e)}"
+        return {
+            "text": f"❌ Request error: {str(e)}",
+            "search_queries": [],
+            "sources": []
+        }

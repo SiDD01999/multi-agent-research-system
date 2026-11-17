@@ -26,9 +26,10 @@ multi-agent-research-system/
 ├── logs/                 # Ignored by git; session files: execution_logs_<timestamp>.txt
 ├── core/
 │   ├── __init__.py       # Package marker
-│   ├── llm.py            # Standard Gemini API caller (urllib, zero external client deps)
+│   ├── llm.py            # Gemini API caller + Google Search Grounding (urllib, zero external client deps)
+│   ├── tools.py          # Real-time web search tool (Google Search Grounding + DuckDuckGo fallback)
 │   ├── logger.py         # SessionLogger: records entire interactive session until Ctrl+C
-│   └── graph.py          # State schema, 3 agent nodes, conditional edge, MemorySaver checkpointer
+│   └── graph.py          # State schema, 4 agent nodes, conditional edge, MemorySaver checkpointer
 ├── .agents/skills/       # Project skills directory
 │   └── langgraph-multi-agent-system/SKILL.md  # This skill specification
 └── README.md             # High-level documentation & interview cheat sheet
@@ -38,37 +39,41 @@ multi-agent-research-system/
 
 ## 🧠 2. Core Architectural Pillars Implemented
 
-### Pillar 1: The Evaluator-Optimizer Cyclic Graph
+### Pillar 1: The Evaluator-Optimizer Cyclic Graph with Web Search
 ```
-START ──► [Memory Compactor] ──► [Agent 1: Researcher] ──► [Agent 2: LLM Judge] ──► should_continue?
-                                       ▲                                                    │
-                                       │                    (Score < 8.5 & Improving)       │
-                                       └─────────────────── "revise" ◄──────────────────────┤
-                                                                                            │
-                                                            (Score >= 8.5 / Plateau / Limit)│
-                                                            "finalize" ─────────────────────► [Agent 3: Formatter] ──► END
+START ──► [Memory Compactor] ──► [Web Search Agent] ──► [Agent 1: Researcher] ──► [Agent 2: LLM Judge] ──► should_continue?
+                                         ▲                                                                         │
+                                         │                           (Score < 8.5 & Improving)                     │
+                                         └────────────────────────── "revise" ◄────────────────────────────────────┤
+                                                                                                                   │
+                                                                           (Score >= 8.5 / Plateau / Limit)        │
+                                                                           "finalize" ─────────────────────────────► [Formatter] ──► END
 ```
 
 ### Pillar 2: State Schema & Smart Reducer (`core/graph.py`)
 ```python
 from typing import TypedDict, Optional, List, Annotated, Any
 
-def manage_chat_history(existing: Optional[List[dict]], incoming: Any) -> List[dict]:
-    """Smart reducer supporting both message appending and compactor replacement."""
-    existing = list(existing or [])
-    if not incoming:
-        return existing
-    if isinstance(incoming, dict) and incoming.get("mode") == "replace":
-        return list(incoming.get("messages", []))
-    if isinstance(incoming, list):
-        return existing + incoming
-    return existing
+class Source(TypedDict):
+    title: str
+    url: str
+
+class Evaluation(TypedDict):
+    completeness: int        # 1-10
+    technical_depth: int     # 1-10
+    structure: int           # 1-10
+    grounding: int           # 1-10 🆕 Real-world web sources, facts, and citations
+    overall_score: float     # Average of 4 dimensions
+    gaps: List[str]          # Actionable deficiencies
 
 class ResearchState(TypedDict):
     prompt: str
-    summary: Optional[str]                             # 🆕 Progressive rolling summary
-    chat_history: Annotated[List[dict], manage_chat_history]  # 🆕 Bounded active buffer
+    summary: Optional[str]                             # Progressive rolling summary
+    chat_history: Annotated[List[dict], manage_chat_history]  # Bounded active buffer
     draft: Optional[str]
+    search_queries: List[str]                          # 🆕 Search queries executed
+    sources: List[Source]                              # 🆕 Clickable web source citations
+    web_evidence: Optional[str]                        # 🆕 Live extracted evidence
     evaluation: Optional[Evaluation]
     score_history: List[float]       # Tracks progression across cycles
     final_report: Optional[str]
@@ -76,22 +81,24 @@ class ResearchState(TypedDict):
     exit_reason: Optional[str]
 ```
 
-### Pillar 3: LLM-as-a-Judge with Quantitative Rubric & Plateau Detection
+### Pillar 3: 4-Dimensional LLM Judge & Targeted Gap Correction
+* **Strict Evaluation Rubric**: Evaluates *Completeness*, *Technical Depth*, *Structure*, and *Factual Grounding & Citations*.
+* **Dynamic Gap-Driven Search**: If the Judge deducts points for missing proof or data, the graph loops back to the **Web Search Agent**, which generates queries targeting those exact gaps.
 * **Target Quality Gate**: `TARGET_SCORE = 8.5` (out of 10).
-* **Hard Circuit Breaker**: `MAX_REVISIONS = 3` (prevents infinite runaway loops).
-* **Plateau Detection**: If $\Delta \text{score} < 0.2$ between consecutive cycles, halts early to eliminate diminishing returns and save API tokens.
-* **Targeted Gap Correction**: Researcher receives specific items from `evaluation["gaps"]` rather than blindly regenerating.
+* **Plateau Detection**: If $\Delta \text{score} < 0.2$, halts early to prevent token waste.
 
 ### Pillar 4: Progressive Summary-Buffer Memory (`MemorySaver` + Compactor)
 * Compiled with `checkpointer = MemorySaver()`.
 * Invoked with `config = {"configurable": {"thread_id": f"session_{timestamp}"}}`.
-* **Memory Compactor Pre-Node**: Automatically runs before Researcher. When active messages exceed `BUFFER_LIMIT = 4`, it compresses older turns into a rolling `summary` and keeps only the latest turn in `chat_history`.
-* **Researcher Context**: Combines both the persistent executive summary (long-term) and the immediate dialogue buffer (short-term). Prevents unbounded checkpoint bloat and token waste.
+* **Memory Compactor Pre-Node**: When active buffer exceeds `BUFFER_LIMIT = 4`, older turns are compressed into a rolling `summary` (< 150 words).
+* **Dual-Tier Context**: Researcher receives both long-term executive summary and short-term dialogue buffer.
 
-### Pillar 5: Continuous Session Execution Logger (`core/logger.py`)
-* Created once per `python main.py` invocation: `logs/execution_logs_<timestamp>.txt`.
-* Appends `TURN #1`, `TURN #2`, `TURN #3`... sequentially.
-* Closed gracefully on `Ctrl+C` or `exit` with session duration and total turns.
+### Pillar 5: Real-Time Web Grounding (`core/tools.py`)
+* Dual-engine web search: Native Google Search Grounding via Gemini API (`tools: [{"google_search": {}}]`) with automatic DuckDuckGo fallback.
+* Formatter attaches a verified `### 🌐 Verified Web Sources & Citations` section with markdown hyperlinks.
+
+### Pillar 6: Continuous Session Execution Logger (`core/logger.py`)
+* Persists session execution details, scorecards, and web search evidence to `logs/execution_logs_<timestamp>.txt`.
 
 ---
 
@@ -115,21 +122,16 @@ class ResearchState(TypedDict):
 
 ## 🔮 4. Next Planned Development Milestones
 
-When continuing in a new session, choose from these planned advancements:
+### ✅ Milestone A: Real-Time Web Grounding & Dynamic Search (COMPLETED)
+* Dedicated `web_search` node with Google Search Grounding & DuckDuckGo fallback.
+* Dynamic feedback loop: LLM Judge gaps trigger targeted searches during revision cycles.
+* Formatter attaches verified markdown hyperlinks to original web sources.
 
-### Milestone A: Google Search Tool Grounding (Real-Time Web Research)
-* **Goal**: Enable Agent 1 to query live web search when answering questions requiring current facts, pricing, or news.
-* **Pattern**: Bind `tools = [{'type': 'google_search'}]` via Google GenAI SDK or LangChain ToolNode.
-* **Architecture**:
-  ```
-  START ──► researcher ──► tool_node (Google Search) ──► researcher ──► judge ...
-  ```
-
-### Milestone B: Human-in-the-Loop (Approval Interrupts)
+### 🔜 Milestone B: Human-in-the-Loop (Approval & Steering Interrupts)
 * **Goal**: Pause execution before the Formatter publishes the final report, allowing the user to approve or inject custom guidance.
 * **Pattern**: `workflow.compile(checkpointer=checkpointer, interrupt_before=["formatter"])`.
 
-### Milestone C: Persistent Disk Checkpointer (SQLite / PostgreSQL)
+### 🔜 Milestone C: Persistent Disk Checkpointer (SQLite / PostgreSQL)
 * **Goal**: Persist memory across terminal restarts so sessions survive after exiting `main.py`.
 * **Pattern**: Replace `MemorySaver` with `SqliteSaver.from_conn_string("research_history.db")`.
 

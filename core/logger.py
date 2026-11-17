@@ -56,12 +56,14 @@ class SessionLogger:
             self.write(content)
         self.write("-" * 80)
 
-    def log_scorecard(self, comp: int, depth: int, struct: int, overall: float, target: float, gaps: List[str]):
+    def log_scorecard(self, comp: int, depth: int, struct: int, overall: float, target: float, gaps: List[str], grounding: Optional[int] = None):
         """Log the LLM Judge rubric evaluation"""
         self.write("\n[LLM JUDGE SCORECARD]:")
         self.write(f"  • Completeness:    {comp}/10")
         self.write(f"  • Technical Depth: {depth}/10")
         self.write(f"  • Structure:       {struct}/10")
+        if grounding is not None:
+            self.write(f"  • Grounding/Cites: {grounding}/10")
         self.write(f"  • Overall Score:   {overall}/10 (Target: {target}/10)")
         if gaps:
             self.write("  • Key Gaps Identified:")
