@@ -114,7 +114,26 @@ def call_gemini_grounded(prompt: str, model: str = "gemini-flash-lite-latest", e
         except Exception:
             msg = error_body
         
-        # If model failed due to search tool incompatibility, retry once without search
+        # 1. Retry once if 503 high demand spike occurs
+        if e.code == 503 or "high demand" in error_body.lower():
+            import time
+            time.sleep(2)
+            alt_model = "gemini-flash-latest" if model == "gemini-flash-lite-latest" else "gemini-flash-lite-latest"
+            try:
+                # Retry call with alternate model
+                alt_url = f"https://generativelanguage.googleapis.com/v1beta/models/{alt_model}:generateContent"
+                alt_req = urllib.request.Request(alt_url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
+                with urllib.request.urlopen(alt_req, timeout=40) as alt_resp:
+                    alt_data = json.loads(alt_resp.read().decode("utf-8"))
+                    cands = alt_data.get("candidates", [])
+                    if cands:
+                        parts = cands[0].get("content", {}).get("parts", [])
+                        text = "".join(part.get("text", "") for part in parts).strip()
+                        return {"text": text, "search_queries": [], "sources": []}
+            except Exception:
+                pass
+
+        # 2. If model failed due to search tool incompatibility, retry once without search
         if enable_search and "tool" in error_body.lower():
             return call_gemini_grounded(prompt, model=model, enable_search=False)
 
